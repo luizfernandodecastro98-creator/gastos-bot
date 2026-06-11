@@ -71,7 +71,7 @@ async function salvarNaPlanilha(dados) {
       ]]
     }
   });
-  console.log(`✅ Salvo: ${dados.descricao} - R$ ${dados.valor}`);
+  console.log(`Salvo: ${dados.descricao} - R$ ${dados.valor}`);
 }
 
 async function conectarWhatsApp() {
@@ -80,23 +80,26 @@ async function conectarWhatsApp() {
   const sock = makeWASocket({
     auth: state,
     logger: pino({ level: 'silent' }),
-    printQRInTerminal: true
+    printQRInTerminal: false
   });
 
   sock.ev.on('creds.update', saveCreds);
 
   sock.ev.on('connection.update', ({ connection, lastDisconnect, qr }) => {
     if (qr) {
-      console.log('\n📱 Escaneie o QR Code abaixo com o WhatsApp:\n');
+      console.log('\nEscaneie o QR Code abaixo com o WhatsApp:\n');
       qrcode.generate(qr, { small: true });
     }
     if (connection === 'close') {
       const deveReconectar = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
-      console.log('Conexão encerrada. Reconectando:', deveReconectar);
-      if (deveReconectar) conectarWhatsApp();
+      if (deveReconectar) {
+        setTimeout(conectarWhatsApp, 5000);
+      } else {
+        console.log('Desconectado. Faça login novamente.');
+      }
     }
     if (connection === 'open') {
-      console.log('✅ WhatsApp conectado!');
+      console.log('WhatsApp conectado!');
     }
   });
 
@@ -112,17 +115,17 @@ async function conectarWhatsApp() {
 
       if (!texto) continue;
 
-      console.log(`📩 Mensagem recebida: ${texto}`);
+      console.log(`Mensagem recebida: ${texto}`);
 
       try {
         const dados = await interpretarGasto(texto);
         if (!dados.gasto) {
-          console.log('⏭ Ignorada (não é gasto)');
+          console.log('Ignorada (nao e gasto)');
           continue;
         }
         await salvarNaPlanilha(dados);
       } catch (err) {
-        console.error('Erro ao processar:', err.message);
+        console.error('Erro:', err.message);
       }
     }
   });
