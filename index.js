@@ -1,26 +1,27 @@
-const express = require('express');
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
+const pino = require('pino');
+const qrcode = require('qrcode-terminal');
 const axios = require('axios');
 const { google } = require('googleapis');
+const express = require('express');
 
 const app = express();
 app.use(express.json());
+app.get('/', (req, res) => res.send('Bot rodando ✓'));
+app.listen(process.env.PORT || 3000);
 
-// ─── CONFIGURAÇÕES ───────────────────────────────────────
-const CLAUDE_API_KEY    = process.env.CLAUDE_API_KEY;
-const GRUPO_ID          = process.env.GRUPO_ID;        // ex: 5544999999999-1234567890@g.us
-const SPREADSHEET_ID    = process.env.SPREADSHEET_ID;  // ID da sua planilha Google
-const SHEET_NAME        = 'Gastos';                    // nome da aba
+const CLAUDE_API_KEY = process.env.CLAUDE_API_KEY;
+const GRUPO_ID       = process.env.GRUPO_ID;
+const SPREADSHEET_ID = process.env.SPREADSHEET_ID;
+const SHEET_NAME     = 'Gastos';
 
-// ─── AUTENTICAÇÃO GOOGLE ──────────────────────────────────
 const auth = new google.auth.GoogleAuth({
   credentials: JSON.parse(process.env.GOOGLE_CREDENTIALS),
   scopes: ['https://www.googleapis.com/auth/spreadsheets'],
 });
 
-// ─── FUNÇÃO: interpretar mensagem com Claude ──────────────
 async function interpretarGasto(mensagem) {
   const hoje = new Date().toLocaleDateString('pt-BR');
-
   const response = await axios.post(
     'https://api.anthropic.com/v1/messages',
     {
@@ -29,7 +30,6 @@ async function interpretarGasto(mensagem) {
       messages: [{
         role: 'user',
         content: `Você é um assistente que extrai dados de gastos de mensagens em português.
-        
 Analise esta mensagem e extraia as informações de gasto.
 Se a mensagem NÃO for sobre um gasto ou despesa, retorne: {"gasto": false}
 Se for um gasto, retorne SOMENTE JSON válido, sem texto extra:
@@ -40,7 +40,6 @@ Se for um gasto, retorne SOMENTE JSON válido, sem texto extra:
   "descricao": "descrição breve",
   "valor": número sem R$ ou pontos
 }
-
 Mensagem: "${mensagem}"`
       }]
     },
@@ -52,16 +51,12 @@ Mensagem: "${mensagem}"`
       }
     }
   );
-
-  const texto = response.data.content[0].text.trim();
-  return JSON.parse(texto);
+  return JSON.parse(response.data.content[0].text.trim());
 }
 
-// ─── FUNÇÃO: salvar no Google Sheets ─────────────────────
 async function salvarNaPlanilha(dados) {
   const client = await auth.getClient();
   const sheets = google.sheets({ version: 'v4', auth: client });
-
   await sheets.spreadsheets.values.append({
     spreadsheetId: SPREADSHEET_ID,
     range: `${SHEET_NAME}!A:E`,
@@ -72,50 +67,65 @@ async function salvarNaPlanilha(dados) {
         dados.categoria,
         dados.descricao,
         dados.valor,
-        new Date().toLocaleString('pt-BR')  // timestamp do registro
+        new Date().toLocaleString('pt-BR')
       ]]
+    }
+  });
+  console.log(`✅ Salvo: ${dados.descricao} - R$ ${dados.valor}`);
+}
+
+async function conectarWhatsApp() {
+  const { state, saveCreds } = await useMultiFileAuthState('auth_info');
+
+  const sock = makeWASocket({
+    auth: state,
+    logger: pino({ level: 'silent' }),
+    printQRInTerminal: true
+  });
+
+  sock.ev.on('creds.update', saveCreds);
+
+  sock.ev.on('connection.update', ({ connection, lastDisconnect, qr }) => {
+    if (qr) {
+      console.log('\n📱 Escaneie o QR Code abaixo com o WhatsApp:\n');
+      qrcode.generate(qr, { small: true });
+    }
+    if (connection === 'close') {
+      const deveReconectar = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
+      console.log('Conexão encerrada. Reconectando:', deveReconectar);
+      if (deveReconectar) conectarWhatsApp();
+    }
+    if (connection === 'open') {
+      console.log('✅ WhatsApp conectado!');
+    }
+  });
+
+  sock.ev.on('messages.upsert', async ({ messages }) => {
+    for (const msg of messages) {
+      if (!msg.message) continue;
+      if (msg.key.remoteJid !== GRUPO_ID) continue;
+      if (msg.key.fromMe) continue;
+
+      const texto =
+        msg.message.conversation ||
+        msg.message.extendedTextMessage?.text;
+
+      if (!texto) continue;
+
+      console.log(`📩 Mensagem recebida: ${texto}`);
+
+      try {
+        const dados = await interpretarGasto(texto);
+        if (!dados.gasto) {
+          console.log('⏭ Ignorada (não é gasto)');
+          continue;
+        }
+        await salvarNaPlanilha(dados);
+      } catch (err) {
+        console.error('Erro ao processar:', err.message);
+      }
     }
   });
 }
 
-// ─── WEBHOOK: recebe mensagens da Evolution API ───────────
-app.post('/webhook', async (req, res) => {
-  res.sendStatus(200); // responde rápido pro webhook não dar timeout
-
-  try {
-    const event = req.body;
-
-    // só processa mensagens de texto recebidas
-    if (event.event !== 'messages.upsert') return;
-    const msg = event.data?.message;
-    if (!msg) return;
-
-    const remoteJid = event.data.key?.remoteJid;
-    const texto = msg.conversation || msg.extendedTextMessage?.text;
-
-    // só processa o grupo configurado
-    if (remoteJid !== GRUPO_ID) return;
-    if (!texto) return;
-
-    console.log(`Mensagem recebida: ${texto}`);
-
-    // interpreta com Claude
-    const dados = await interpretarGasto(texto);
-    if (!dados.gasto) {
-      console.log('Mensagem ignorada (não é gasto)');
-      return;
-    }
-
-    // salva na planilha
-    await salvarNaPlanilha(dados);
-    console.log(`Gasto salvo: ${dados.descricao} - R$ ${dados.valor}`);
-
-  } catch (err) {
-    console.error('Erro:', err.message);
-  }
-});
-
-app.get('/', (req, res) => res.send('Bot de gastos rodando ✓'));
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Servidor rodando na porta ${PORT}`));
+conectarWhatsApp();
